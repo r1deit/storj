@@ -77,7 +77,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=1 \
     CC="zig cc -target aarch64-linux-musl" \
     go build -trimpath \
-      -ldflags '-linkmode external -extldflags "-static" -X storj.io/common/version.buildRelease=true' \
+      -ldflags '-linkmode external -extldflags "-static" -X storj.io/common/version.buildVersion=v1.164.2 -X storj.io/common/version.buildRelease=true' \
       -o /out/storagenode \
       ./cmd/storagenode
 
