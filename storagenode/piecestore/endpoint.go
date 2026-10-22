@@ -692,6 +692,25 @@ func (endpoint *Endpoint) Download(stream pb.DRPCPiecestore_DownloadStream) (err
 			"expected get or get repair or audit action got %v", limit.Action)
 	}
 
+	requestLimit := endpoint.config.MaxConcurrentRequests * 2
+	liveRequests := endpoint.liveRequests.Load()
+
+	if limit.Action == pb.PieceAction_GET &&
+		requestLimit > 0 &&
+		int(liveRequests) > requestLimit {
+
+		endpoint.log.Info("download rejected, too many requests",
+			zap.Int32("live_requests", liveRequests),
+			zap.Int("request_limit", requestLimit),
+		)
+
+		return rpcstatus.NamedError(
+			"cancel-unsupported",
+			rpcstatus.Unavailable,
+			"stream does not support canceling",
+		)
+	}
+
 	if chunk.ChunkSize > limit.Limit {
 		return rpcstatus.NamedErrorf("limit-exceeded", rpcstatus.InvalidArgument,
 			"requested more that order limit allows, limit=%v requested=%v", limit.Limit, chunk.ChunkSize)
