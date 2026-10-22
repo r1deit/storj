@@ -126,6 +126,12 @@ if [[ -n "${LOG_LEVEL:-}" ]]; then
     ARGS+=("--log.level=${LOG_LEVEL}")
 fi
 
+# Implement RUN_PARAMS YAML
+if [[ -n "${RUN_PARAMS:-}" ]]; then
+    read -r -a EXTRA_ARGS <<< "${RUN_PARAMS}"
+    ARGS+=("${EXTRA_ARGS[@]}")
+fi
+
 exec "${BINARY}" "${ARGS[@]}" "$@"
 SCRIPT
 
