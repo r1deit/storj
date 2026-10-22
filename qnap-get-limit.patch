@@ -1,0 +1,42 @@
+From 072ce597a2e11a2d1b8df73756e66878152ef2f1 Mon Sep 17 00:00:00 2001
+From: r1deit <riki.petrovich@gmail.com>
+Date: Thu, 22 Oct 2026 13:54:39 +0300
+Subject: [PATCH] Add ordinary GET request limit for weak NAS
+
+---
+ storagenode/piecestore/endpoint.go | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/storagenode/piecestore/endpoint.go b/storagenode/piecestore/endpoint.go
+index 36ba201ee..afcdd5022 100644
+--- a/storagenode/piecestore/endpoint.go
++++ b/storagenode/piecestore/endpoint.go
+@@ -692,6 +692,25 @@ func (endpoint *Endpoint) Download(stream pb.DRPCPiecestore_DownloadStream) (err
+ 			"expected get or get repair or audit action got %v", limit.Action)
+ 	}
+ 
++	requestLimit := endpoint.config.MaxConcurrentRequests * 2
++	liveRequests := endpoint.liveRequests.Load()
++
++	if limit.Action == pb.PieceAction_GET &&
++		requestLimit > 0 &&
++		int(liveRequests) > requestLimit {
++
++		endpoint.log.Info("download rejected, too many requests",
++			zap.Int32("live_requests", liveRequests),
++			zap.Int("request_limit", requestLimit),
++		)
++
++		return rpcstatus.NamedError(
++			"cancel-unsupported",
++			rpcstatus.Unavailable,
++			"stream does not support canceling",
++		)
++	}
++
+ 	if chunk.ChunkSize > limit.Limit {
+ 		return rpcstatus.NamedErrorf("limit-exceeded", rpcstatus.InvalidArgument,
+ 			"requested more that order limit allows, limit=%v requested=%v", limit.Limit, chunk.ChunkSize)
+-- 
+2.56.0.windows.2
+
