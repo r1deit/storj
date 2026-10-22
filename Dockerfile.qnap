@@ -1,0 +1,151 @@
+
+# syntax=docker/dockerfile:1.7
+
+ARG GO_VERSION=1.26.6
+ARG NODE_VERSION=24.11.1
+
+# Build the Storage Node web console.
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION} AS web
+
+WORKDIR /work
+
+COPY web/storagenode/package*.json ./
+
+RUN --mount=type=cache,target=/root/.npm npm ci
+
+COPY web/storagenode/ ./
+
+RUN --mount=type=cache,target=/root/.npm npm run build
+
+
+# Cross-compile the custom Storage Node for ARM64.
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION} AS build
+
+ARG BUILDPLATFORM
+ARG ZIG_VERSION=0.16.0
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        wget \
+        xz-utils \
+        ca-certificates \
+        git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Download Zig and verify its checksum.
+RUN case "${BUILDPLATFORM}" in \
+      "linux/amd64") \
+        ZIG_ARCH=x86_64; \
+        ZIG_SHA256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;; \
+      "linux/arm64") \
+        ZIG_ARCH=aarch64; \
+        ZIG_SHA256=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;; \
+      *) \
+        echo "Unsupported build platform: ${BUILDPLATFORM}"; \
+        exit 1 ;; \
+    esac && \
+    wget "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" && \
+    echo "${ZIG_SHA256}  zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" | sha256sum -c - && \
+    tar -xf "zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" && \
+    mv "zig-${ZIG_ARCH}-linux-${ZIG_VERSION}" /usr/local/zig && \
+    rm "zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
+
+ENV PATH="${PATH}:/usr/local/zig"
+
+WORKDIR /work
+
+# Download Go dependencies.
+COPY go.mod go.sum ./
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+# Copy the source code from this GitHub branch.
+COPY . /work/
+
+# Include the web assets embedded in Storage Node.
+COPY --from=web /work/dist/ /work/web/storagenode/dist/
+
+# Build the actual Storj binary for ARM64.
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    mkdir -p /out && \
+    GOOS=linux \
+    GOARCH=arm64 \
+    CGO_ENABLED=1 \
+    CC="zig cc -target aarch64-linux-musl" \
+    go build -trimpath \
+      -ldflags '-linkmode external -extldflags "-static" -X storj.io/common/version.buildRelease=true' \
+      -o /out/storagenode \
+      ./cmd/storagenode
+
+# Create a startup script that runs our binary directly.
+RUN <<'EOF'
+cat > /out/entrypoint-qnap <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+BINARY="/usr/local/bin/storagenode-qnap"
+
+export STORJ_CONSOLE_ADDRESS="${STORJ_CONSOLE_ADDRESS:-0.0.0.0:14002}"
+
+MODE="run"
+if [[ "${SETUP:-false}" == "true" ]]; then
+    MODE="setup"
+fi
+
+ARGS=(
+    "${MODE}"
+    --config-dir /app/config
+    --identity-dir /app/identity
+)
+
+if [[ -n "${VERSION_SERVER_URL:-}" ]]; then
+    ARGS+=("--version.server-address=${VERSION_SERVER_URL}")
+fi
+
+if [[ -n "${STORAGE:-}" ]]; then
+    ARGS+=("--storage.allocated-disk-space=${STORAGE}")
+fi
+
+if [[ -n "${ADDRESS:-}" ]]; then
+    ARGS+=("--contact.external-address=${ADDRESS}")
+fi
+
+if [[ -n "${EMAIL:-}" ]]; then
+    ARGS+=("--operator.email=${EMAIL}")
+fi
+
+if [[ -n "${WALLET:-}" ]]; then
+    ARGS+=("--operator.wallet=${WALLET}")
+fi
+
+if [[ -n "${LOG_LEVEL:-}" ]]; then
+    ARGS+=("--log.level=${LOG_LEVEL}")
+fi
+
+exec "${BINARY}" "${ARGS[@]}" "$@"
+SCRIPT
+
+chmod 0755 /out/entrypoint-qnap
+EOF
+
+
+# Keep the official image as the runtime base, but use our binary.
+FROM --platform=linux/arm64 storjlabs/storagenode:latest AS runtime
+
+USER root
+
+COPY --from=build --chmod=0755 \
+    /out/storagenode \
+    /usr/local/bin/storagenode-qnap
+
+COPY --from=build --chmod=0755 \
+    /out/entrypoint-qnap \
+    /entrypoint-qnap
+
+# Do not invoke the official entrypoint: it can download official
+# binaries and replace the custom Storage Node binary.
+ENTRYPOINT ["/entrypoint-qnap"]
