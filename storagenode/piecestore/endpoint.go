@@ -89,6 +89,7 @@ type Config struct {
 	DatabaseDir             string        `help:"directory to store databases. if empty, uses data path" default:""`
 	ExpirationGracePeriod   time.Duration `help:"how soon before expiration date should things be considered expired" default:"48h0m0s"`
 	MaxConcurrentRequests   int           `help:"how many concurrent requests are allowed, before uploads are rejected. 0 represents unlimited." default:"0"`
+	MaxConcurrentGetRequests int `help:"maximum live requests threshold for GET downloads. 0 represents unlimited." default:"0"`
 	OrderLimitGracePeriod   time.Duration `help:"how long after OrderLimit creation date are OrderLimits no longer accepted" default:"1h0m0s"`
 	CacheSyncInterval       time.Duration `help:"how often the space used cache is synced to persistent storage" releaseDefault:"1h0m0s" devDefault:"0h1m0s"`
 	PieceScanOnStartup      bool          `help:"if set to true, all pieces disk usage is recalculated on startup" default:"true"`
@@ -692,7 +693,7 @@ func (endpoint *Endpoint) Download(stream pb.DRPCPiecestore_DownloadStream) (err
 			"expected get or get repair or audit action got %v", limit.Action)
 	}
 
-	requestLimit := endpoint.config.MaxConcurrentRequests * 2
+	requestLimit := endpoint.config.MaxConcurrentGetRequests
 	liveRequests := endpoint.liveRequests.Load()
 
 	if limit.Action == pb.PieceAction_GET &&

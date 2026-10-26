@@ -1527,6 +1527,112 @@ func (s *Store) checkFreeSpace(ctx context.Context, tableAmount, logsAmount uint
 	return nil
 }
 
+// qnapCompactionCopyConfig caches optional Hashstore compaction-copy settings.
+var qnapCompactionCopyConfig struct {
+    once       sync.Once
+    chunkBytes int64
+    delay      time.Duration
+}
+
+// qnapCompactionCopySettings reads the optional environment variables once.
+// A zero chunk size or zero delay disables throttling and preserves io.CopyN.
+func qnapCompactionCopySettings() (int64, time.Duration) {
+    qnapCompactionCopyConfig.once.Do(func() {
+        const (
+            bytesPerMiB = int64(1 << 20)
+            maxChunkMiB = int64(1024)
+            maxDelayMS  = int64(60000)
+        )
+
+        if raw := strings.TrimSpace(os.Getenv("QNAP_HASHSTORE_COMPACTION_COPY_CHUNK_MIB")); raw != "" {
+            if mib, err := strconv.ParseInt(raw, 10, 64); err == nil && mib > 0 && mib <= maxChunkMiB {
+                qnapCompactionCopyConfig.chunkBytes = mib * bytesPerMiB
+            }
+        }
+
+        if raw := strings.TrimSpace(os.Getenv("QNAP_HASHSTORE_COMPACTION_COPY_DELAY_MS")); raw != "" {
+            if ms, err := strconv.ParseInt(raw, 10, 64); err == nil && ms > 0 && ms <= maxDelayMS {
+                qnapCompactionCopyConfig.delay = time.Duration(ms) * time.Millisecond
+            }
+        }
+    })
+
+    return qnapCompactionCopyConfig.chunkBytes, qnapCompactionCopyConfig.delay
+}
+
+// qnapCompactionCopyLimiter shares an aggregate byte counter across all
+// satellite stores within this storagenode process.
+var qnapCompactionCopyLimiter struct {
+    mu        sync.Mutex
+    remaining int64
+    next      time.Time
+}
+
+// copyNWithQNAPCompactionThrottle copies data in aggregate chunks. The mutex
+// serializes each copy segment and is released during the delay. Mutex
+// acquisition is not strictly FIFO, so this does not guarantee fair rotation.
+func copyNWithQNAPCompactionThrottle(ctx context.Context, dst io.Writer, src io.Reader, size int64) (int64, error) {
+    if size <= 0 {
+        return 0, nil
+    }
+
+    chunkBytes, delay := qnapCompactionCopySettings()
+    if chunkBytes == 0 || delay == 0 {
+        return io.CopyN(dst, src, size)
+    }
+
+    var total int64
+    for total < size {
+        if err := ctx.Err(); err != nil {
+            return total, err
+        }
+
+        qnapCompactionCopyLimiter.mu.Lock()
+        if qnapCompactionCopyLimiter.remaining == 0 {
+            wait := time.Until(qnapCompactionCopyLimiter.next)
+            if wait > 0 {
+                qnapCompactionCopyLimiter.mu.Unlock()
+
+                timer := time.NewTimer(wait)
+                select {
+                case <-timer.C:
+                    continue
+                case <-ctx.Done():
+                    if !timer.Stop() {
+                        select {
+                        case <-timer.C:
+                        default:
+                        }
+                    }
+                    return total, ctx.Err()
+                }
+            }
+            qnapCompactionCopyLimiter.remaining = chunkBytes
+        }
+
+        part := size - total
+        if part > qnapCompactionCopyLimiter.remaining {
+            part = qnapCompactionCopyLimiter.remaining
+        }
+
+        copied, copyErr := io.CopyN(dst, src, part)
+        total += copied
+        qnapCompactionCopyLimiter.remaining -= copied
+        if copied > 0 && qnapCompactionCopyLimiter.remaining == 0 {
+            qnapCompactionCopyLimiter.next = time.Now().Add(delay)
+        }
+        qnapCompactionCopyLimiter.mu.Unlock()
+
+        if copyErr != nil {
+            return total, copyErr
+        }
+        if copied == 0 {
+            return total, io.ErrNoProgress
+        }
+    }
+
+    return total, nil
+}
 func (s *Store) rewriteRecord(ctx context.Context, rec Record, rewriteCandidates map[uint64]bool) (_ Record, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -1577,7 +1683,7 @@ func (s *Store) rewriteRecord(ctx context.Context, rec Record, rewriteCandidates
 	}
 
 	// copy the record data.
-	if _, err := io.CopyN(into.fh, from, int64(rec.Length)); err != nil {
+	if _, err := copyNWithQNAPCompactionThrottle(ctx, into.fh, from, int64(rec.Length)); err != nil {
 		// if we couldn't write the data, we should abort the write operation and attempt to reclaim
 		// space by truncating to the saved offset.
 		_ = into.fh.Truncate(offset)
