@@ -33,6 +33,9 @@ import (
 	"storj.io/storj/storagenode/hashstore/platform"
 )
 
+// ActiveCompactions counts Compact calls that are running or waiting.
+var ActiveCompactions atomic.Int32
+
 // Store is a hash table based key-value store with compaction.
 type Store struct {
 	// immutable data
@@ -862,6 +865,16 @@ type CompactArguments struct {
 // trash by the callback to expire in the future. It also rewrites any log files that have too much
 // dead data.
 func (s *Store) Compact(ctx context.Context, args CompactArguments) (err error) {
+    n := ActiveCompactions.Add(1)
+    defer func() {
+        n := ActiveCompactions.Add(-1)
+        s.log.Info("hashstore compaction counter decremented",
+            zap.Int32("active_compactions", n),
+        )
+    }()
+    s.log.Info("hashstore compaction counter incremented",
+        zap.Int32("active_compactions", n),
+    )
 	defer mon.Task()(&ctx)(&err)
 	defer s.stats.compactions.Add(1) // increase the number of compactions that have finished
 

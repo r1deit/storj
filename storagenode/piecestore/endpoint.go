@@ -38,6 +38,7 @@ import (
 	"storj.io/storj/shared/bloomfilter"
 	"storj.io/storj/storagenode/bandwidth"
 	"storj.io/storj/storagenode/blobstore/filestore"
+	"storj.io/storj/storagenode/hashstore"
 	"storj.io/storj/storagenode/monitor"
 	"storj.io/storj/storagenode/orders"
 	"storj.io/storj/storagenode/orders/ordersfile"
@@ -318,7 +319,7 @@ func (endpoint *Endpoint) Upload(stream pb.DRPCPiecestore_UploadStream) (err err
 
 	endpoint.pingStats.WasPinged(time.Now())
 
-	if endpoint.config.MaxConcurrentRequests > 0 && int(liveRequests) > endpoint.config.MaxConcurrentRequests {
+	if (hashstore.ActiveCompactions.Load() > 0) || (endpoint.config.MaxConcurrentRequests > 0 && int(liveRequests) > endpoint.config.MaxConcurrentRequests) {
 		endpoint.log.Info("upload rejected, too many requests",
 			zap.Int32("live_requests", liveRequests),
 			zap.Int("request_limit", endpoint.config.MaxConcurrentRequests),
@@ -697,8 +698,8 @@ func (endpoint *Endpoint) Download(stream pb.DRPCPiecestore_DownloadStream) (err
 	liveRequests := endpoint.liveRequests.Load()
 
 	if limit.Action == pb.PieceAction_GET &&
-		requestLimit > 0 &&
-		int(liveRequests) > requestLimit {
+		((requestLimit > 0 && int(liveRequests) > requestLimit) ||
+			hashstore.ActiveCompactions.Load() > 0) {
 
 		endpoint.log.Info("download rejected, too many requests",
 			zap.Int32("live_requests", liveRequests),
