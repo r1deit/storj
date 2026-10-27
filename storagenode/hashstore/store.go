@@ -957,6 +957,13 @@ func (s *Store) Compact(ctx context.Context, args CompactArguments) (err error) 
 	// until we have no log files left to rewrite. this does more work (reads and writes the hash
 	// table each time we need to write a log file) but ensures we use minimal extra disk space when
 	// we need to rewrite multiple log files.
+	roundDelay := qnapCompactionRoundDelaySettings()
+	if roundDelay > 0 {
+		s.log.Info(
+			"QNAP compaction round delay enabled",
+			zap.Duration("delay", roundDelay),
+		)
+	}
 	for {
 		compactionRounds++
 		completed, err := s.compactOnce(ctx, today, expired, restored, args.ShouldTrash)
@@ -964,6 +971,20 @@ func (s *Store) Compact(ctx context.Context, args CompactArguments) (err error) 
 			return err
 		} else if completed {
 			break
+		}
+		if roundDelay > 0 {
+			timer := time.NewTimer(roundDelay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return ctx.Err()
+			}
 		}
 	}
 
@@ -1558,6 +1579,38 @@ func qnapCompactionCopySettings() (int64, time.Duration) {
     })
 
     return qnapCompactionCopyConfig.chunkBytes, qnapCompactionCopyConfig.delay
+}
+
+// qnapCompactionRoundDelayConfig caches the optional pause between
+// consecutive compaction rounds.
+var qnapCompactionRoundDelayConfig struct {
+	once  sync.Once
+	delay time.Duration
+}
+
+// qnapCompactionRoundDelaySettings reads the pause between compaction rounds.
+// A value of zero disables the pause.
+func qnapCompactionRoundDelaySettings() time.Duration {
+	qnapCompactionRoundDelayConfig.once.Do(func() {
+		const maxDelaySeconds int64 = 3600
+
+		raw := strings.TrimSpace(os.Getenv(
+			"QNAP_HASHSTORE_COMPACTION_ROUND_DELAY_SECONDS",
+		))
+		if raw == "" {
+			return // Default: 0 seconds.
+		}
+
+		seconds, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || seconds < 0 || seconds > maxDelaySeconds {
+			return // Invalid value: 0 seconds.
+		}
+
+		qnapCompactionRoundDelayConfig.delay =
+			time.Duration(seconds) * time.Second
+	})
+
+	return qnapCompactionRoundDelayConfig.delay
 }
 
 // qnapCompactionCopyLimiter shares an aggregate byte counter across all
