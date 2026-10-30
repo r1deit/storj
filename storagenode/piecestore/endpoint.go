@@ -91,6 +91,7 @@ type Config struct {
 	ExpirationGracePeriod   time.Duration `help:"how soon before expiration date should things be considered expired" default:"48h0m0s"`
 	MaxConcurrentRequests   int           `help:"how many concurrent requests are allowed, before uploads are rejected. 0 represents unlimited." default:"0"`
 	MaxConcurrentGetRequests int `help:"maximum live requests threshold for GET downloads. 0 represents unlimited." default:"0"`
+	Rejector int `help:"number of additional requests to reject after each failed request; 0 disables the rejector" default:"0"`
 	OrderLimitGracePeriod   time.Duration `help:"how long after OrderLimit creation date are OrderLimits no longer accepted" default:"1h0m0s"`
 	CacheSyncInterval       time.Duration `help:"how often the space used cache is synced to persistent storage" releaseDefault:"1h0m0s" devDefault:"0h1m0s"`
 	PieceScanOnStartup      bool          `help:"if set to true, all pieces disk usage is recalculated on startup" default:"true"`
@@ -142,6 +143,9 @@ type Endpoint struct {
 	signatureCheck signaturecheck.Check
 
 	liveRequests atomic.Int32
+
+	putRejector *Rejector
+	getRejector *Rejector
 }
 
 // QueueRetain is an interface for retaining pieces in the queue and checking status.
@@ -158,6 +162,9 @@ type RestoreTrash interface {
 
 // NewEndpoint creates a new piecestore endpoint.
 func NewEndpoint(log *zap.Logger, ident *identity.FullIdentity, trustSource trust.TrustedSatelliteSource, monitor *monitor.Service, retain []QueueRetain, pingStats PingStatsSource, pieceBackend PieceBackend, ordersStore *orders.FileStore, usage bandwidth.Writer, usedSerials *usedserials.Table, signatureCheck signaturecheck.Check, config Config) (*Endpoint, error) {
+	if config.Rejector < 0 || int64(config.Rejector) > int64(maxRejectorCount) {
+		return nil, errs.New("rejector must be between 0 and 2147483647")
+	}
 	if signatureCheck == nil {
 		signatureCheck = &signaturecheck.Full{}
 	}
@@ -177,6 +184,8 @@ func NewEndpoint(log *zap.Logger, ident *identity.FullIdentity, trustSource trus
 
 		pieceBackend:   pieceBackend,
 		signatureCheck: signatureCheck,
+		putRejector:    NewRejector(int32(config.Rejector)),
+		getRejector:    NewRejector(int32(config.Rejector)),
 	}, nil
 }
 
@@ -297,6 +306,15 @@ var (
 
 // Upload handles uploading a piece on piece store.
 func (endpoint *Endpoint) Upload(stream pb.DRPCPiecestore_UploadStream) (err error) {
+	var committed bool
+	var skipRejectorRecord bool
+	defer func() {
+		if endpoint.putRejector == nil || skipRejectorRecord || committed || err == nil {
+			return
+		}
+		endpoint.putRejector.RecordFailure()
+	}()
+
 	ctx := stream.Context()
 	defer monLiveRequests(&ctx)(&err)
 	defer mon.Task()(&ctx)(&err)
@@ -320,9 +338,21 @@ func (endpoint *Endpoint) Upload(stream pb.DRPCPiecestore_UploadStream) (err err
 	endpoint.pingStats.WasPinged(time.Now())
 
 	if (hashstore.ActiveCompactions.Load() > 0) || (endpoint.config.MaxConcurrentRequests > 0 && int(liveRequests) > endpoint.config.MaxConcurrentRequests) {
+		skipRejectorRecord = true
 		endpoint.log.Info("upload rejected, too many requests",
 			zap.Int32("live_requests", liveRequests),
 			zap.Int("request_limit", endpoint.config.MaxConcurrentRequests),
+		)
+		errMsg := fmt.Sprintf("storage node overloaded, request limit: %d", endpoint.config.MaxConcurrentRequests)
+		return rpcstatus.NamedError("storagenode-overloaded", rpcstatus.Unavailable, errMsg)
+	}
+
+	if rejected, before, after := endpoint.putRejector.TryReject(); rejected {
+		skipRejectorRecord = true
+		endpoint.log.Info("upload rejected by rejector",
+			zap.Int32("live_requests", liveRequests),
+			zap.Int32("rejector", before),
+			zap.Int32("rejector_remaining", after),
 		)
 		errMsg := fmt.Sprintf("storage node overloaded, request limit: %d", endpoint.config.MaxConcurrentRequests)
 		return rpcstatus.NamedError("storagenode-overloaded", rpcstatus.Unavailable, errMsg)
@@ -389,7 +419,6 @@ func (endpoint *Endpoint) Upload(stream pb.DRPCPiecestore_UploadStream) (err err
 	// committed is set to true when the piece is committed.
 	// It is used to distinguish successful pieces where the uplink cancels the connections,
 	// and pieces that were actually canceled before being completed.
-	var committed bool
 	defer func() {
 		endTime := time.Now().UTC()
 		dt := endTime.Sub(startTime)
@@ -649,6 +678,17 @@ func (endpoint *Endpoint) isCongested() bool {
 
 // Download handles Downloading a piece on piecestore.
 func (endpoint *Endpoint) Download(stream pb.DRPCPiecestore_DownloadStream) (err error) {
+	var skipRejectorRecord bool
+	var downloadSuccessful bool
+	defer func() {
+		if endpoint.getRejector == nil || skipRejectorRecord {
+			return
+		}
+		if err != nil || !downloadSuccessful {
+			endpoint.getRejector.RecordFailure()
+		}
+	}()
+
 	ctx := stream.Context()
 	defer monLiveRequests(&ctx)(&err)
 	defer mon.Task()(&ctx)(&err)
@@ -701,6 +741,7 @@ func (endpoint *Endpoint) Download(stream pb.DRPCPiecestore_DownloadStream) (err
 		((requestLimit > 0 && int(liveRequests) > requestLimit) ||
 			hashstore.ActiveCompactions.Load() > 0) {
 
+		skipRejectorRecord = true
 		endpoint.log.Info("download rejected, too many requests",
 			zap.Int32("live_requests", liveRequests),
 			zap.Int("request_limit", requestLimit),
@@ -711,6 +752,23 @@ func (endpoint *Endpoint) Download(stream pb.DRPCPiecestore_DownloadStream) (err
 			rpcstatus.Unavailable,
 			"stream does not support canceling",
 		)
+	}
+
+	if limit.Action == pb.PieceAction_GET {
+		if rejected, before, after := endpoint.getRejector.TryReject(); rejected {
+			skipRejectorRecord = true
+			endpoint.log.Info("download rejected by rejector",
+				zap.Int32("live_requests", liveRequests),
+				zap.Int("request_limit", requestLimit),
+				zap.Int32("rejector", before),
+				zap.Int32("rejector_remaining", after),
+			)
+			return rpcstatus.NamedError(
+				"cancel-unsupported",
+				rpcstatus.Unavailable,
+				"stream does not support canceling",
+			)
+		}
 	}
 
 	if chunk.ChunkSize > limit.Limit {
@@ -802,6 +860,7 @@ func (endpoint *Endpoint) Download(stream pb.DRPCPiecestore_DownloadStream) (err
 				log.Error("download failed", zap.Error(err))
 			}
 		} else {
+			downloadSuccessful = true
 			mon.Counter("download_success_count", actionSeriesTag).Inc(1)
 			mon.Meter("download_success_byte_meter", actionSeriesTag).Mark64(downloadSize)
 			mon.IntVal("download_success_size_bytes", actionSeriesTag).Observe(downloadSize)
